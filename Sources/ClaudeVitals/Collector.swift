@@ -4,7 +4,7 @@ import Foundation
 
 let PROJ = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
 /// Grace window: a session whose `claude` process has exited lingers this long as an "ended" card
-/// before dropping off. Live sessions are never subject to this (they stay via the live-repo branch).
+/// before dropping off. Live sessions are never subject to this (they stay via the live-session set).
 let RECENT_WINDOW: TimeInterval = 3 * 60
 let LIVE_FILE_S: TimeInterval = 5
 let SUBAGENT_LIVE_S: TimeInterval = 10
@@ -35,6 +35,7 @@ func lsofCwd(_ pid: String) -> String {
     return ""
 }
 
+/// FALLBACK ONLY (see `liveness`): used when Claude Code has no session registry.
 /// repo cwd -> count of live interactive `claude` processes (absolute tool paths: .app PATH lacks /usr/sbin).
 ///
 /// `pgrep` is cheap and runs every tick; the per-pid `lsof` (the slow call) runs ONLY for pids we
@@ -135,8 +136,8 @@ func headMetaCached(_ path: String, cache: CollectorCache) -> (cwd: String, bran
 /// Age (file mtime) is the PRIMARY signal — it's reliable regardless of process detection. `isLive`
 /// (a detected `claude` process is driving this exact session) is used only as a POSITIVE upgrade:
 /// it promotes a quiet finished turn from "ended" to "waiting prompt". It never forces "ended", so a
-/// session that's actively being written is never mislabeled when `pgrep` fails to see its process
-/// (observed: `pgrep -f` misses live VS Code `claude` processes). The old code returned "waiting
+/// session that's actively being written is never mislabeled when liveness detection misses its process
+/// (observed on the `pgrep` fallback, which misses some live VS Code `claude` processes). The old code returned "waiting
 /// prompt" for ANY `end_turn` at any age, so a session that finished 15 min ago looked like a live
 /// agent awaiting input — the stale-card bug.
 func deriveState(lastType: String?, lastStop: String?, asksUser: Bool, age: TimeInterval, isLive: Bool) -> (Dot, String) {
@@ -206,9 +207,9 @@ func deriveSubagents(_ sessionFile: String) -> (total: Int, running: Int) {
     return (jsonls.count, running)
 }
 
-/// The session file each live agent is actively driving: the newest `.jsonl` in every live repo.
-/// This is per-SESSION liveness — within one repo only the active session counts as live, so older
-/// sessions (e.g. after /clear, restart, or compaction) are correctly treated as ended, not "waiting".
+/// FALLBACK ONLY (see `liveness`): the process scan knows which repos have a live agent but not which
+/// session each one drives, so it approximates with the newest `.jsonl` per live repo. With several
+/// sessions open in one repo only the newest counts as live - the registry path has no such limit.
 func liveSessionFiles(live: [String: Int]) -> Set<String> {
     let fm = FileManager.default
     var files = Set<String>()
@@ -223,10 +224,39 @@ func liveSessionFiles(live: [String: Int]) -> Set<String> {
     return files
 }
 
-/// Every PROJ/*/*.jsonl touched < RECENT_WINDOW (grace), plus each live repo's active session (always).
-/// `activeFiles` is the already-computed `liveSessionFiles(live:)` set, passed in so the (dir-scanning)
-/// computation runs once per tick rather than once here and again in buildSnapshot.
-func candidateFiles(live: [String: Int], activeFiles: Set<String>) -> Set<String> {
+/// Which sessions are live right now: the transcript each one drives, and a per-cwd session count.
+struct Liveness {
+    let files: Set<String>
+    let repos: [String: Int]
+    /// True when the registry named this exact session; false when the process scan guessed the
+    /// newest transcript per repo.
+    let confirmed: Bool
+}
+
+/// The session registry is the source of liveness: one entry per running session, keyed by session id,
+/// so several sessions in one repo are each live (the process scan could only bless the newest
+/// transcript per repo) and terminal sessions count too. No `pgrep`/`lsof` while the registry reports
+/// a live session. The process scan takes over when the registry has nothing live to say: no directory
+/// (older Claude Code), or a directory the running Claude Code does not populate (a stale one left next
+/// to an older pinned install). That costs one `pgrep` per tick, and only while nothing is live.
+func liveness(cache: CollectorCache) -> Liveness {
+    let entries = readRegistry().filter { isLiveEntry($0) }
+    guard !entries.isEmpty else {
+        let repos = liveRepos(cache: cache)
+        return Liveness(files: liveSessionFiles(live: repos), repos: repos, confirmed: false)
+    }
+    var files = Set<String>()
+    var repos: [String: Int] = [:]
+    for e in entries {
+        repos[e.cwd, default: 0] += 1
+        if let path = transcriptPath(for: e) { files.insert(path) }
+    }
+    return Liveness(files: files, repos: repos, confirmed: true)
+}
+
+/// Every PROJ/*/*.jsonl touched < RECENT_WINDOW (grace), plus every live session's transcript (always),
+/// plus any hook-seeded transcript paths (a brand-new session emits SessionStart before its file ages in).
+func candidateFiles(active: Set<String>, extra: Set<String> = []) -> Set<String> {
     let fm = FileManager.default
     let now = Date()
     var files = Set<String>()
@@ -241,8 +271,9 @@ func candidateFiles(live: [String: Int], activeFiles: Set<String>) -> Set<String
             }
         }
     }
-    // A live agent's active session always shows, even if it's been quietly waiting longer than the grace.
-    return files.union(activeFiles)
+    return files.union(active).union(extra.filter { p in
+        (mtime(p).map { now.timeIntervalSince($0) < RECENT_WINDOW }) ?? false
+    })
 }
 
 // MARK: - Cross-tick caches (actor-owned; bound the per-tick cost)
@@ -262,11 +293,12 @@ struct ParsedSession {
     let ctx: Int
     let ctxLimit: Int
     let ctxModel: String
+    let title: String        // Claude's auto chat title (from the last `ai-title` line), "" if none
 }
 
 /// Reused across refreshes inside the Collector actor so each tick only does work the filesystem
 /// actually changed: head meta read once per path, parsed tail re-read only on mtime/size change,
-/// pid->cwd `lsof` only for new processes.
+/// pid->cwd `lsof` only for new processes (process-scan fallback only).
 final class CollectorCache {
     var pidCwd: [String: String] = [:]                          // pid -> cwd (stable for process life)
     var head: [String: (cwd: String, branch: String)] = [:]     // path -> immutable head meta
@@ -283,22 +315,26 @@ func parseSession(_ path: String, mtime m: Date, size: Int, cache: CollectorCach
         $0.type == "tool_use" && USER_PROMPT_TOOLS.contains($0.name ?? "")
     } ?? false
     let (ctx, limit, model) = deriveContext(lines)
+    let title = lines.last { $0.type == "ai-title" }?.aiTitle ?? ""
     let p = ParsedSession(mtime: m, size: size,
                           lastType: lastConv?.type, lastStop: lastConv?.message?.stop_reason,
                           asksUser: asksUser,
-                          ctx: ctx, ctxLimit: limit, ctxModel: model)
+                          ctx: ctx, ctxLimit: limit, ctxModel: model, title: title)
     cache.parsed[path] = p
     return p
 }
 
 // MARK: - Snapshot assembly (the single source of truth)
 
-func buildSnapshot(parser: TranscriptParser, cache: CollectorCache) -> Snapshot {
-    let live = liveRepos(cache: cache)
-    let activeFiles = liveSessionFiles(live: live)   // the exact session each live agent is driving
+func buildSnapshot(parser: TranscriptParser, cache: CollectorCache,
+                   hooks: [String: HookStatus] = [:], hookFiles: Set<String> = []) -> Snapshot {
+    let liveNow = liveness(cache: cache)
+    let live = liveNow.repos
+    let activeFiles = liveNow.files                  // the exact transcript each live session is driving
     let now = Date()
     var blocks: [Block] = []
-    let candidates = candidateFiles(live: live, activeFiles: activeFiles)
+    var anyHookDriven = false
+    let candidates = candidateFiles(active: activeFiles, extra: hookFiles)
 
     for f in candidates {
         guard let m = mtime(f) else { continue }
@@ -308,26 +344,29 @@ func buildSnapshot(parser: TranscriptParser, cache: CollectorCache) -> Snapshot 
         let (subsTotal, subsRunning) = deriveSubagents(f)
         let e = parser.effort(path: f)
 
-        // Per-session liveness: a card is "live" only if it's the session an alive `claude` process is
-        // actively driving. Project-level matching (dirName) still recovers cwd/pids when head lacks them.
-        let isLive = activeFiles.contains(f)
+        let sessionId = URL(fileURLWithPath: f).deletingPathExtension().lastPathComponent
+        let heuristicIsLive = activeFiles.contains(f)
         let dirName = URL(fileURLWithPath: f).deletingLastPathComponent().lastPathComponent
         let liveMatch = live.first { encodeRepo($0.key) == dirName }
         let cwd = headCwd.isEmpty ? (liveMatch?.key ?? "") : headCwd
         let repo = cwd.isEmpty ? dirName : URL(fileURLWithPath: cwd).lastPathComponent
 
-        let (dot, state) = deriveState(lastType: ps.lastType, lastStop: ps.lastStop, asksUser: ps.asksUser, age: age, isLive: isLive)
+        let heuristic = deriveState(lastType: ps.lastType, lastStop: ps.lastStop, asksUser: ps.asksUser, age: age, isLive: heuristicIsLive)
+        let resolved = resolveState(heuristic: (heuristic.0, heuristic.1), isLive: heuristicIsLive,
+                                    liveConfirmed: liveNow.confirmed && heuristicIsLive,
+                                    hook: hooks[sessionId], transcriptMtime: m, now: now)
+        if resolved.usedHook { anyHookDriven = true }
 
         blocks.append(Block(
-            sessionId: URL(fileURLWithPath: f).deletingPathExtension().lastPathComponent,
-            repo: repo, cwd: cwd, branch: branch, age: Int(age),
-            dot: dot, state: state,
+            sessionId: sessionId,
+            repo: repo, title: ps.title, cwd: cwd, branch: branch, age: Int(age),
+            dot: resolved.dot, state: resolved.state,
             ctx: ps.ctx, ctxLimit: ps.ctxLimit, ctxPct: ps.ctxLimit > 0 ? Double(ps.ctx) / Double(ps.ctxLimit) * 100 : 0,
             model: ps.ctxModel == "?" ? e.model : ps.ctxModel,
             inTok: e.inTok, outTok: e.outTok, cw: e.cw, cr: e.cr, cost: e.cost,
             turns: e.turns, tools: e.tools,
             subsTotal: subsTotal, subsRunning: subsRunning,
-            live: isLive, pids: liveMatch?.value ?? 0))
+            live: resolved.live, pids: liveMatch?.value ?? 0))
     }
 
     cache.parsed = cache.parsed.filter { candidates.contains($0.key) }   // drop sessions out of the window
@@ -342,18 +381,38 @@ func buildSnapshot(parser: TranscriptParser, cache: CollectorCache) -> Snapshot 
         totalOut: blocks.reduce(0) { $0 + $1.outTok },
         totalCw: blocks.reduce(0) { $0 + $1.cw },
         totalCr: blocks.reduce(0) { $0 + $1.cr },
-        totalCost: blocks.reduce(0) { $0 + $1.cost })
+        totalCost: blocks.reduce(0) { $0 + $1.cost },
+        hookDriven: anyHookDriven)
 }
 
 /// One-shot (headless --dump): fresh caches, full parse once.
 func buildSnapshot() -> Snapshot { buildSnapshot(parser: TranscriptParser(), cache: CollectorCache()) }
 
 /// GUI path: persistent caches live inside the actor, so each refresh only re-reads files that
-/// changed and only `lsof`s newly-seen pids (effort stays O(appended bytes)).
+/// changed and, on the process-scan fallback, only `lsof`s newly-seen pids (effort stays O(appended bytes)). Hook state also lives
+/// here so all state funnels through one actor (no extra locking).
 actor Collector {
     private let parser = TranscriptParser()
     private let cache = CollectorCache()
-    func snapshot() -> Snapshot { buildSnapshot(parser: parser, cache: cache) }
+    private var hooks: [String: HookStatus] = [:]
+    private var hookFiles: Set<String> = []
+
+    func snapshot() -> Snapshot { buildSnapshot(parser: parser, cache: cache, hooks: hooks, hookFiles: hookFiles) }
+
+    /// Fold one hook event into per-session state, seed its transcript as a candidate, and rebuild.
+    /// Prune AFTER building: a session that still has a card keeps its hook state however long it has
+    /// been silent (an unanswered permission prompt emits nothing while it waits), so only sessions that
+    /// have already dropped off age out. Bounded by the card count plus one window of new arrivals.
+    func ingest(_ e: HookEvent) -> Snapshot {
+        if let s = applyHookEvent(hooks[e.session_id], e, at: Date()) { hooks[e.session_id] = s }
+        if let tp = e.transcript_path { hookFiles.insert(tp) }
+        let snap = buildSnapshot(parser: parser, cache: cache, hooks: hooks, hookFiles: hookFiles)
+        let cutoff = Date().addingTimeInterval(-RECENT_WINDOW)
+        let onCard = Set(snap.blocks.map(\.sessionId))
+        hooks = hooks.filter { onCard.contains($0.key) || $0.value.at > cutoff }
+        hookFiles = hookFiles.filter { (mtime($0).map { $0 > cutoff }) ?? false }
+        return snap
+    }
 }
 
 // MARK: - Formatting (shared by --dump and the UI)

@@ -4,9 +4,6 @@ A native macOS **menu-bar** app showing live Claude Code session status across e
 side-by-side cards with state, context-fill ring, and effort/cost. Reads `~/.claude` and the process
 list only. **No network, no API, no Apple Developer account.**
 
-This is the Swift rewrite of an earlier Python `rumps` prototype; the data layer was verified to
-match it exactly.
-
 ---
 
 ## Run
@@ -73,11 +70,14 @@ check spends ~1 token of your quota. First run may show a one-time Keychain prom
 
 ## How it works (data layer)
 
-Same sources as the Python prototype, all verified:
+Data sources, all verified:
 
-- **Live sessions** — `/usr/bin/pgrep -f 'native-binary/claude.*stream-json'` → PIDs;
-  `/usr/sbin/lsof` → each PID's cwd. Liveness is matched to a session by **encoded project-dir name**
-  (robust even if a transcript header lacks `cwd`).
+- **Live sessions** - Claude Code's session registry, `~/.claude/sessions/<pid>.json` (the data behind
+  `claude agents --json`): one entry per running session with its `sessionId` and `cwd`. An entry is
+  live when its pid is running and that process started no later than the session, which rules out a
+  stale file whose pid was reused. When the registry reports no live session (no directory on older
+  Claude Code, or a directory the running version does not populate) the app falls back to
+  `pgrep` + `lsof` and treats the newest transcript per repo as the live one.
 - **Transcripts** — `~/.claude/projects/<encoded-path>/<uuid>.jsonl`; file mtime = activity.
 - **State** — scans the tail backward for the last `user`/`assistant` line (transcripts end with
   non-conversational lines) + file age.
@@ -91,14 +91,33 @@ Polling is adaptive: **1.5s** while anything runs, **5s** idle. Parsing runs off
 
 ---
 
+## Fast triggers (optional plugin)
+
+For instant, precise status (permission prompts, turn/ tool transitions, subagent activity) install the
+bundled Claude Code plugin once:
+
+    /plugin install ./plugin/claude-vitals
+
+At user scope it applies to every session in every repo. Its hooks push lifecycle events over a Unix
+domain socket (`~/.claude-vitals/vitals.sock`) to the running app, which uses them as the authoritative,
+low-latency source of session state while the transcript stays the source of tokens/context/cost. Hook
+state stays authoritative while the session registry confirms the session is alive, and falls back to
+transcript polling when it can't be confirmed (a fresh hook still wins for one short window regardless)
+or the transcript advances without new hook events.
+Without the plugin the app falls back to transcript polling exactly as before. Disable anytime via
+`/plugin`.
+
+---
+
 ## Source map
 
 | File | Responsibility |
 |---|---|
-| `Entry.swift` | `@main`; `--dump` branch vs launching the GUI; sets `.accessory` (no Dock icon). |
+| `Entry.swift` | `@main`; `--dump`/`--selfcheck` branches vs launching the GUI; sets `.accessory` (no Dock icon). |
 | `App.swift` | `MenuBarExtra(.window)` scene + `AppDelegate`. |
 | `Models.swift` | Tolerant Codable transcript subset; `Dot`/`Block`/`Snapshot`/`Effort`. |
-| `Collector.swift` | pgrep/lsof, candidate files, state/context/sub-agents, `buildSnapshot`, `Collector` actor. |
+| `SessionRegistry.swift` | Claude Code session registry: tolerant read, pid liveness + pid-reuse check, entry -> transcript. |
+| `Collector.swift` | Liveness (registry, pgrep/lsof fallback), candidate files, state/context/sub-agents, `buildSnapshot`, `Collector` actor. |
 | `TranscriptParser.swift` | Incremental effort cache (mtime+offset gated) + pricing. |
 | `Store.swift` | `@MainActor` observable store, adaptive poll loop, running→waiting edge detection. |
 | `Views.swift` | Popover, header, session card, context ring, pulse dot, footer, menu-bar label. |

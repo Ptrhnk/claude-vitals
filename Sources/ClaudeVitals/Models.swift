@@ -38,8 +38,9 @@ struct Line: Decodable {
     let gitBranch: String?
     let timestamp: String?
     let message: Message?
+    let aiTitle: String?   // present only on `type: "ai-title"` lines (Claude's auto chat title)
 
-    enum CodingKeys: String, CodingKey { case type, cwd, gitBranch, timestamp, message }
+    enum CodingKeys: String, CodingKey { case type, cwd, gitBranch, timestamp, message, aiTitle }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -48,21 +49,23 @@ struct Line: Decodable {
         gitBranch = (try? c.decodeIfPresent(String.self, forKey: .gitBranch)) ?? nil
         timestamp = (try? c.decodeIfPresent(String.self, forKey: .timestamp)) ?? nil
         message = (try? c.decodeIfPresent(Message.self, forKey: .message)) ?? nil
+        aiTitle = (try? c.decodeIfPresent(String.self, forKey: .aiTitle)) ?? nil
     }
 }
 
 // MARK: - Derived domain types (all Sendable to cross the actor boundary cleanly)
 
 enum Dot: String, Sendable, Equatable {
-    case runningModel, runningTool, waiting, idle, ended
+    case runningModel, runningTool, waiting, waitingPermission, idle, ended
 
     var glyph: String {
         switch self {
-        case .runningModel: return "🟢"
-        case .runningTool:  return "🔧"
-        case .waiting:      return "🟡"
-        case .idle:         return "⚪️"
-        case .ended:        return "⚫️"
+        case .runningModel:      return "🟢"
+        case .runningTool:       return "🔧"
+        case .waiting:           return "🟡"
+        case .waitingPermission: return "🔐"
+        case .idle:              return "⚪️"
+        case .ended:             return "⚫️"
         }
     }
     var isRunning: Bool { self == .runningModel || self == .runningTool }
@@ -84,6 +87,7 @@ struct Block: Sendable, Identifiable {
     var id: String { sessionId }
     let sessionId: String
     let repo: String
+    let title: String
     let cwd: String
     let branch: String
     let age: Int
@@ -107,7 +111,9 @@ struct Snapshot: Sendable {
     let subsRunning: Int
     let totalIn: Int, totalOut: Int, totalCw: Int, totalCr: Int
     let totalCost: Double
+    let hookDriven: Bool   // any card currently backed by fresh hook state
 
     static let empty = Snapshot(blocks: [], running: 0, subsRunning: 0,
-                                totalIn: 0, totalOut: 0, totalCw: 0, totalCr: 0, totalCost: 0)
+                                totalIn: 0, totalOut: 0, totalCw: 0, totalCr: 0, totalCost: 0,
+                                hookDriven: false)
 }
