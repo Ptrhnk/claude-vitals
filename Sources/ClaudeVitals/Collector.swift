@@ -224,7 +224,9 @@ func liveSessionFiles(live: [String: Int]) -> Set<String> {
 }
 
 /// Every PROJ/*/*.jsonl touched < RECENT_WINDOW (grace), plus each live repo's active session (always).
-func candidateFiles(live: [String: Int]) -> Set<String> {
+/// `activeFiles` is the already-computed `liveSessionFiles(live:)` set, passed in so the (dir-scanning)
+/// computation runs once per tick rather than once here and again in buildSnapshot.
+func candidateFiles(live: [String: Int], activeFiles: Set<String>) -> Set<String> {
     let fm = FileManager.default
     let now = Date()
     var files = Set<String>()
@@ -240,7 +242,7 @@ func candidateFiles(live: [String: Int]) -> Set<String> {
         }
     }
     // A live agent's active session always shows, even if it's been quietly waiting longer than the grace.
-    return files.union(liveSessionFiles(live: live))
+    return files.union(activeFiles)
 }
 
 // MARK: - Cross-tick caches (actor-owned; bound the per-tick cost)
@@ -296,7 +298,7 @@ func buildSnapshot(parser: TranscriptParser, cache: CollectorCache) -> Snapshot 
     let activeFiles = liveSessionFiles(live: live)   // the exact session each live agent is driving
     let now = Date()
     var blocks: [Block] = []
-    let candidates = candidateFiles(live: live)
+    let candidates = candidateFiles(live: live, activeFiles: activeFiles)
 
     for f in candidates {
         guard let m = mtime(f) else { continue }
